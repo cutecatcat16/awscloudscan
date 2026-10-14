@@ -180,7 +180,7 @@ awscloudscan -p PROFILE -r REGION [options]
 
 ```bash
 # Standard run
-awscloudscan -p mfa-cloud-uat-auditor-user -r ap-southeast-1
+awscloudscan -p cloud-uat-auditor-user -r ap-southeast-1
 
 # Full run — every module CloudFox's all-checks covers
 awscloudscan -p prod-admin -r us-east-1 --all-modules
