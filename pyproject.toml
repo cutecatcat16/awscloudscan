@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "awscloudscan"
+version = "0.1.0"
+description = "CloudFox + PMapper wrapper with DeepSeek-assisted analysis and an in-account Markdown report"
+requires-python = ">=3.9"
+dependencies = ["requests>=2.25.0"]
+
+# A normal install (`pip install .`) generates this console script correctly. An
+# *editable* install (`pip install -e .`) records the absolute source path instead,
+# so moving the checkout breaks the command — for a development checkout use
+# `./install.sh`, which installs a symlink launcher that cannot go stale.
+[project.scripts]
+awscloudscan = "cloudscan.cli:main"
+
+[tool.setuptools]
+packages = ["cloudscan"]

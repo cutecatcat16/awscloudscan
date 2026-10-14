@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Scan output and artifacts
+awscloudscan-output/
+cloudfox-output/
+verify-cache.json
+analysis.json
+evidence-digest.md
+pmapper-analysis.json
+pmapper-analysis.txt
+thinking-stage*.md
+
+# Editors and OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
