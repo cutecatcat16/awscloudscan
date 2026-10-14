@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Dict, List, Optional, Sequence
 
-from . import __version__
+from . import __version__, priority
 from .scope import Scope
 from .util import truncate
 
@@ -16,8 +16,15 @@ def _sev_rank(value: str) -> int:
     return _SEVERITY_ORDER.get((value or "").strip().lower(), 5)
 
 
-def _sort_by_severity(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return sorted(items, key=lambda f: (_sev_rank(str(f.get("severity", ""))), str(f.get("title", ""))))
+def _sort_findings(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Order items worst first, by the deterministic priority table.
+
+    See :mod:`cloudscan.priority`: severity alone cannot rank a ``*`` trust above
+    a stale public load balancer, so the ordering lives in a rule table rather
+    than in an ad-hoc sort here. Severity is the tiebreaker; ties keep their
+    incoming order.
+    """
+    return priority.sort_findings(items)
 
 
 def _cell(value: Any) -> str:
@@ -158,7 +165,7 @@ def render_report(
     # -- escalation paths -----------------------------------------------------
     lines.append("## Possible privilege-escalation paths")
     lines.append("")
-    escalation_paths = _sort_by_severity(analysis.escalation_paths) if analysis else []
+    escalation_paths = _sort_findings(analysis.escalation_paths) if analysis else []
     if not escalation_paths:
         lines.append("_No escalation paths were identified from the available evidence._")
         lines.append("")
@@ -220,14 +227,14 @@ def render_report(
     else:
         lines.append("| ID | Severity | Category | Finding | Confidence |")
         lines.append("| --- | --- | --- | --- | --- |")
-        for finding in _sort_by_severity(in_scope_findings):
+        for finding in _sort_findings(in_scope_findings):
             lines.append(
                 f"| {_cell(finding.get('id'))} | {_cell(finding.get('severity'))} | "
                 f"{_cell(finding.get('category'))} | {_cell(finding.get('title'))} | "
                 f"{_cell(finding.get('confidence'))} |"
             )
         lines.append("")
-        for finding in _sort_by_severity(in_scope_findings):
+        for finding in _sort_findings(in_scope_findings):
             lines.append(f"### {finding.get('id', 'FINDING')} — {finding.get('title', 'Finding')}")
             lines.append("")
             lines.append(f"**Severity:** {finding.get('severity', 'Unknown')}  ")
@@ -259,7 +266,7 @@ def render_report(
     if include_out_of_scope and out_of_scope_findings:
         lines.append("## Out-of-scope items (included on request)")
         lines.append("")
-        for finding in _sort_by_severity(out_of_scope_findings):
+        for finding in _sort_findings(out_of_scope_findings):
             lines.append(f"### {finding.get('id', 'FINDING')} — {finding.get('title', 'Finding')}")
             lines.append("")
             lines.append(f"**Severity:** {finding.get('severity', 'Unknown')}  ")
@@ -285,7 +292,7 @@ def render_report(
         lines.append("")
         lines.append("| ID | Severity | Scope | Finding | Reason |")
         lines.append("| --- | --- | --- | --- | --- |")
-        for finding in _sort_by_severity(out_of_scope_findings):
+        for finding in _sort_findings(out_of_scope_findings):
             meta = finding.get("_scope", {})
             lines.append(
                 f"| {_cell(finding.get('id'))} | {_cell(finding.get('severity'))} | "

@@ -5,14 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import config
-from .deepseek import DeepSeekClient, DeepSeekError
+from . import config, priority
+from .deepseek import DeepSeekClient, DeepSeekError, DeepSeekTruncation
 # Everything the prompt *defines* lives in the taxonomy module, so the prompt and
 # the verifier cannot disagree. ``PRIVESC_ACTIONS`` stays re-exported here for
 # callers that still reach for it.
 from .issues import (CATEGORY_PRIVESC, LATERAL_MOVEMENT, PRIVESC_ACTIONS,
-                     PRIVILEGE_ESCALATION, SEVERITY_RANK as _SEVERITY_RANK,
-                     SEVERITY_SCALE,
+                     PRIVILEGE_ESCALATION, SEVERITY_SCALE,
                      is_escalation as _escalation_action,
                      report_categories, taxonomy_text)
 from .scope import Scope
@@ -487,19 +486,19 @@ def build_findings_messages(digest: str, escalations: Dict[str, Any], evidence, 
 
 
 def _worst_first(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-    """Cap a stage's reply at *limit*, keeping the most severe items.
+    """Cap a stage's reply at *limit*, keeping the items that matter most.
 
-    The cap is enforced here as well as stated in the instruction, so a reply
-    that ignores the instruction cannot inflate the report. ``sorted`` is stable,
-    so items the model graded alike keep the order the model gave them — its
-    ranking survives inside a severity band and the cut is deterministic rather
-    than an artifact of how many items it happened to emit.
+    Ranking is the deterministic priority table (:mod:`cloudscan.priority`), not
+    a bare severity sort: two High findings are not equally interesting, and the
+    table says which is which. The cap is enforced here as well as stated in the
+    instruction, so a reply that ignores the instruction cannot inflate the
+    report. ``sorted`` is stable, so items a rank and severity tie keep the order
+    the model gave them — its judgement inside a band survives the cut.
     """
     if len(items) <= limit:
         return items
-    ranked = sorted(items,
-                    key=lambda item: -_SEVERITY_RANK.get(str(item.get("severity", "")).strip(), 0))
-    info(f"trimmed {len(items)} items to the {limit} most severe")
+    ranked = priority.sort_findings(items)
+    info(f"trimmed {len(items)} items to the {limit} highest priority")
     return ranked[:limit]
 
 
@@ -515,6 +514,12 @@ class Analysis:
     escalation_reasoning: str = ""
     findings_reasoning: str = ""
     warnings: List[str] = field(default_factory=list)
+    #: Names of the stages whose reply was cut off at its token budget. Kept
+    #: apart from ``warnings`` so the caller can tell a stage that needed more
+    #: room from one that could not reach the API at all — the two need opposite
+    #: fixes, and the run's closing advice must not blame the network for a
+    #: budget problem.
+    truncated_stages: List[str] = field(default_factory=list)
     used_ai: bool = False
 
 
@@ -557,21 +562,49 @@ def _forget_last_result(client: DeepSeekClient) -> None:
         client.last_result = None
 
 
+def _fallback_summary(analysis: Analysis) -> str:
+    """An honest summary when the model produced none.
+
+    It must not claim more is missing than really is. The findings themselves are
+    deterministic (the simulator, the resource-to-role join, PMapper), they are
+    ordered by the priority table, and they are all present — what is absent is
+    the model's *narrative*: the prose, and the escalation walk-through.
+    """
+    if analysis.truncated_stages:
+        where = ("both stages" if len(analysis.truncated_stages) > 1
+                 else analysis.truncated_stages[0])
+        reason = f"the DeepSeek reply for {where} was cut off at its token budget"
+    else:
+        reason = "no DeepSeek analysis could be produced"
+    return ("DeepSeek review was unavailable, so this report carries no AI-written narrative and "
+            f"no AI escalation walk-through ({reason}). The findings themselves are deterministic "
+            "and complete: verified grants come from iam:SimulatePrincipalPolicy, escalation "
+            "edges from the resource-to-role join, and PMapper findings straight from PMapper. "
+            "They are ordered worst first by the built-in priority table, not by the model.")
+
+
 def analyze(client: DeepSeekClient, evidence, scope: Scope, *, digest_budget: Optional[int] = None,
-            stream_reasoning: bool = False) -> Analysis:
+            stream_reasoning: bool = False, max_tokens: Optional[int] = None) -> Analysis:
     """Run the two-stage DeepSeek analysis, degrading gracefully on failure.
 
     With ``stream_reasoning=True`` both stages request SSE and echo their
     thinking to stdout as it is generated; the text is kept on the returned
     :class:`Analysis` as well, so the caller can save it beside the report.
+
+    ``max_tokens`` overrides the per-stage completion budget for both stages;
+    without it each stage uses its own default from :mod:`cloudscan.config`. A
+    stage cut off at its budget is recorded in ``truncated_stages`` rather than
+    lumped in with a connectivity failure — the fixes are different.
     """
     analysis = Analysis()
     digest = build_evidence_digest(evidence, scope, budget=digest_budget)
+    stage1_tokens, stage2_tokens = config.deepseek_stage_budgets(max_tokens)
 
     # Stage 1: escalation paths.
     try:
         _forget_last_result(client)
-        raw = client.chat_json(build_escalation_messages(digest, evidence, scope), max_tokens=8000,
+        raw = client.chat_json(build_escalation_messages(digest, evidence, scope),
+                               max_tokens=stage1_tokens,
                                stream=stream_reasoning, label=_STAGE_ESCALATION)
         analysis.escalations_raw = raw
         analysis.summary = str(raw.get("summary", "")).strip()
@@ -580,6 +613,10 @@ def analyze(client: DeepSeekClient, evidence, scope: Scope, *, digest_budget: Op
             analysis.escalation_paths = _worst_first(
                 [p for p in paths if isinstance(p, dict)], _MAX_ESCALATION_PATHS)
         analysis.used_ai = True
+    except DeepSeekTruncation as exc:
+        analysis.truncated_stages.append(_STAGE_ESCALATION)
+        analysis.warnings.append(f"escalation analysis was truncated: {exc}")
+        warn(str(exc))
     except DeepSeekError as exc:
         analysis.warnings.append(f"escalation analysis failed: {exc}")
         warn(str(exc))
@@ -590,13 +627,18 @@ def analyze(client: DeepSeekClient, evidence, scope: Scope, *, digest_budget: Op
     try:
         _forget_last_result(client)
         raw = client.chat_json(build_findings_messages(digest, analysis.escalations_raw, evidence, scope),
-                               max_tokens=12000, stream=stream_reasoning, label=_STAGE_FINDINGS)
+                               max_tokens=stage2_tokens, stream=stream_reasoning,
+                               label=_STAGE_FINDINGS)
         analysis.findings_raw = raw
         findings = raw.get("findings")
         if isinstance(findings, list):
             analysis.findings = _worst_first([f for f in findings if isinstance(f, dict)],
                                              _MAX_FINDINGS)
         analysis.used_ai = True
+    except DeepSeekTruncation as exc:
+        analysis.truncated_stages.append(_STAGE_FINDINGS)
+        analysis.warnings.append(f"findings review was truncated: {exc}")
+        warn(str(exc))
     except DeepSeekError as exc:
         analysis.warnings.append(f"findings review failed: {exc}")
         warn(str(exc))
@@ -607,7 +649,11 @@ def analyze(client: DeepSeekClient, evidence, scope: Scope, *, digest_budget: Op
         if fallback:
             info(f"using {len(fallback)} deterministic PMapper finding(s) as fallback")
             analysis.findings = fallback
-        if not analysis.summary:
-            analysis.summary = ("DeepSeek analysis was unavailable; this report contains the deterministic "
-                                "PMapper findings and the raw CloudFox evidence only.")
+    # The summary is filled whenever it is missing, not only when there are no
+    # findings. A run whose stage 1 failed but whose verified findings merged in
+    # downstream still needs the report to say what is and is not AI-authored —
+    # and must not claim to hold nothing but raw evidence when it holds 115
+    # simulator-confirmed findings.
+    if not analysis.summary:
+        analysis.summary = _fallback_summary(analysis)
     return analysis

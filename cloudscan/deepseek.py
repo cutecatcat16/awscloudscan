@@ -17,6 +17,17 @@ class DeepSeekError(RuntimeError):
     """Raised when the DeepSeek API cannot be reached or returns an error."""
 
 
+class DeepSeekTruncation(DeepSeekError):
+    """The reply hit *max_tokens* (finish_reason=length) and is incomplete.
+
+    Distinct from the transport failures :class:`DeepSeekError` also covers, so a
+    caller can tell "the key or the network is broken" apart from "this stage
+    needs a bigger budget". Both are fatal to a stage, but only one is fixed by
+    raising the budget — and blaming the wrong one sends the operator hunting for
+    a connectivity problem that does not exist.
+    """
+
+
 @dataclass
 class ChatResult:
     """One completion, plus the thinking that produced it.
@@ -317,24 +328,31 @@ class DeepSeekClient:
         json_mode: bool = False,
         stream: bool = False,
         label: Optional[str] = None,
+        thinking_override: Optional[str] = None,
     ) -> ChatResult:
         """Run one completion and return it with its reasoning.
 
         ``stream=True`` requests SSE and echoes the reasoning to stdout as it is
         generated; ``label`` names the block in that header (the stage being run).
+        ``thinking_override`` forces thinking on or off for this call alone, so a
+        truncated JSON reply can be retried with the whole budget going to the
+        answer (see :meth:`chat_json`).
         """
         self.require()
+        thinking = thinking_override or self.cfg.thinking
+        thinking_on = (thinking or "").lower() == "enabled"
         payload: Dict[str, Any] = {
             "model": self.cfg.model,
             "messages": messages,
             "max_tokens": max_tokens,
             "stream": stream,
         }
-        thinking_on = (self.cfg.thinking or "").lower() == "enabled"
-        if self.cfg.reasoning_effort:
+        # ``reasoning_effort`` is a thinking-mode parameter; sending it alongside
+        # thinking:disabled is meaningless at best and a 400 at worst.
+        if self.cfg.reasoning_effort and thinking_on:
             payload["reasoning_effort"] = self.cfg.reasoning_effort
-        if self.cfg.thinking:
-            payload["thinking"] = {"type": self.cfg.thinking}
+        if thinking:
+            payload["thinking"] = {"type": thinking}
         # Thinking mode accepts but ignores temperature/presence/frequency penalties,
         # so only send temperature when thinking is off.
         if not thinking_on:
@@ -343,8 +361,8 @@ class DeepSeekClient:
             payload["response_format"] = {"type": "json_object"}
 
         info(f"querying DeepSeek ({self.cfg.model}"
-             f"{', effort=' + self.cfg.reasoning_effort if self.cfg.reasoning_effort else ''}"
-             f"{', thinking=' + self.cfg.thinking if self.cfg.thinking else ''}"
+             f"{', effort=' + self.cfg.reasoning_effort if thinking_on and self.cfg.reasoning_effort else ''}"
+             f"{', thinking=' + thinking if thinking else ''}"
              f"{', stream' if stream else ''})"
              f" — {sum(len(m.get('content', '')) for m in messages)} chars of context")
         started = time.time()
@@ -387,17 +405,85 @@ class DeepSeekClient:
         max_tokens: int = 8000,
         stream: bool = False,
         label: Optional[str] = None,
+        thinking_override: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Run one completion and parse a JSON object out of it.
+
+        A truncated reply is retried once with thinking disabled before it is
+        given up on — see :meth:`_retry_without_thinking`.
+        """
         result = self.chat(messages, temperature=temperature, max_tokens=max_tokens,
-                           json_mode=True, stream=stream, label=label)
+                           json_mode=True, stream=stream, label=label,
+                           thinking_override=thinking_override)
+        first: Optional[ChatResult] = None
+        if result.truncated and thinking_override is None and self._thinking_enabled():
+            first = result
+            result = self._retry_without_thinking(
+                messages, temperature=temperature, max_tokens=max_tokens, stream=stream,
+                label=label, first=result)
         if result.truncated:
-            spent = (f" {result.reasoning_tokens} of those tokens went to thinking."
-                     if result.reasoning_tokens else "")
-            raise DeepSeekError(
-                f"DeepSeek reply was cut off at max_tokens={max_tokens} (finish_reason=length), "
-                f"so the JSON is incomplete.{spent} Lower --deepseek-reasoning-effort, or raise "
-                f"this stage's token budget.")
+            # Report the *first* attempt's thinking spend: it is the attempt that
+            # shows how much of the budget the chain of thought took.
+            reasoning_tokens = max(result.reasoning_tokens,
+                                   first.reasoning_tokens if first else 0)
+            raise DeepSeekTruncation(self._truncation_message(
+                max_tokens, reasoning_tokens, retried_without_thinking=first is not None))
         return parse_json_response(result.content)
+
+    def _thinking_enabled(self) -> bool:
+        return (self.cfg.thinking or "").lower() == "enabled"
+
+    def _retry_without_thinking(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float,
+        max_tokens: int,
+        stream: bool,
+        label: Optional[str],
+        first: ChatResult,
+    ) -> ChatResult:
+        """Re-run a truncated JSON request once with thinking turned off.
+
+        Thinking and the answer share a single completion budget, so a JSON reply
+        that ran out of room is almost always one that spent its allowance
+        reasoning. Disabling thinking for the retry hands the whole budget to the
+        JSON — the only thing this call is for. The first attempt's chain of
+        thought is merged onto the result so the saved transcript stays complete.
+        """
+        warn(f"DeepSeek reply was cut off at max_tokens={max_tokens} "
+             "(finish_reason=length); retrying this stage once with thinking disabled")
+        try:
+            retried = self.chat(messages, temperature=temperature, max_tokens=max_tokens,
+                                json_mode=True, stream=stream, label=label,
+                                thinking_override="disabled")
+        except DeepSeekError:
+            # The retry could not even run; keep the first attempt reachable so the
+            # caller still sees its reasoning and token accounting.
+            self.last_result = first
+            raise
+        retried.reasoning = first.reasoning + retried.reasoning
+        self.last_result = retried
+        return retried
+
+    def _truncation_message(self, max_tokens: int, reasoning_tokens: int,
+                            *, retried_without_thinking: bool = False) -> str:
+        """Explain a truncation, naming levers that can actually change the outcome."""
+        spent = (f" {reasoning_tokens} of those tokens went to thinking."
+                 if reasoning_tokens else "")
+        if retried_without_thinking:
+            advice = ("Even with thinking disabled the answer did not fit, so raise "
+                      "--deepseek-max-tokens")
+        elif self._thinking_enabled():
+            advice = ("Raise --deepseek-max-tokens, or run with --deepseek-thinking disabled "
+                      "so the whole completion budget belongs to the answer")
+            effort = (self.cfg.reasoning_effort or "").lower()
+            if effort and effort != "low":
+                advice += f" (or lower --deepseek-reasoning-effort below {self.cfg.reasoning_effort})"
+        else:
+            advice = "Raise --deepseek-max-tokens"
+        return (f"DeepSeek reply was cut off at max_tokens={max_tokens} "
+                f"(finish_reason=length), so the JSON is incomplete.{spent} {advice}.")
 
 
 def parse_json_response(raw: str) -> Dict[str, Any]:

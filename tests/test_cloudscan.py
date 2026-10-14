@@ -14,13 +14,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cloudscan.collect import Evidence
 from cloudscan.config import DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_DEFAULT_REASONING_EFFORT
-from cloudscan.deepseek import DeepSeekClient, DeepSeekError, parse_json_response
+from cloudscan.deepseek import (DeepSeekClient, DeepSeekError, DeepSeekTruncation,
+                                parse_json_response)
 from cloudscan.prompts import Analysis, analyze
 from cloudscan.report import render_report
 from cloudscan.runner import Identity, RunLogEntry, RunResult
 from cloudscan.scope import (ACCOUNT, EXTERNAL_ACCOUNT, MANAGEMENT_ACCOUNT,
                              ORGANIZATION, Scope, split_findings)
-from cloudscan import config, issues, prompts, resource_edges, util, verify
+from cloudscan import config, issues, priority, prompts, resource_edges, util, verify
 from cloudscan import scope as verify_scope
 
 PASS = 0
@@ -382,6 +383,243 @@ def test_report_render():
     check("out-of-scope item in appendix table", "CLOUDSCAN-02" in md)
     check("the report names the saved reasoning",
           "thinking-stage1-escalation.md" in md, md)
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 recovery: per-stage token budgets, the thinking-off retry, and the
+# deterministic priority ordering that replaced the bare severity sort.
+# ---------------------------------------------------------------------------
+
+def test_deepseek_budget_recovery():
+    print("deepseek token budgets and the thinking-off retry")
+    from cloudscan.cli import build_parser
+
+    # -- budgets --------------------------------------------------------------
+    check("per-stage defaults are exposed",
+          config.DEEPSEEK_STAGE1_MAX_TOKENS > 0 and config.DEEPSEEK_STAGE2_MAX_TOKENS > 0)
+    check("the old 8k/12k budgets are gone",
+          config.DEEPSEEK_STAGE1_MAX_TOKENS >= 32000 and config.DEEPSEEK_STAGE2_MAX_TOKENS >= 32000)
+    check("each stage keeps its own default",
+          config.deepseek_stage_budgets() == (config.DEEPSEEK_STAGE1_MAX_TOKENS,
+                                              config.DEEPSEEK_STAGE2_MAX_TOKENS))
+    check("--deepseek-max-tokens overrides both stages",
+          config.deepseek_stage_budgets(60000) == (60000, 60000))
+    check("a zero/absent override falls back to the defaults",
+          config.deepseek_stage_budgets(0) == config.deepseek_stage_budgets()
+          and config.deepseek_stage_budgets(None) == config.deepseek_stage_budgets())
+    check("a garbage env value does not crash the config",
+          config._env_int("AWSSCLOUDSCAN_DEFINITELY_NOT_SET", 7) == 7)
+
+    parser = build_parser()
+    check("--deepseek-max-tokens is parsed",
+          parser.parse_args(["-p", "prof", "-r", "us-east-1",
+                             "--deepseek-max-tokens", "60000"]).deepseek_max_tokens == 60000)
+    check("no budget override unless asked",
+          parser.parse_args(["-p", "prof", "-r", "us-east-1"]).deepseek_max_tokens is None)
+
+    # -- the retry ------------------------------------------------------------
+    check("truncation is a DeepSeekError", issubclass(DeepSeekTruncation, DeepSeekError))
+
+    attempts = []
+
+    def flaky_post(payload):
+        attempts.append(payload)
+        if payload.get("thinking") == {"type": "enabled"}:
+            return {"choices": [{"message": {"content": '{"findings": [',
+                                             "reasoning_content": "Deep thought."},
+                                 "finish_reason": "length"}],
+                    "usage": {"completion_tokens": 100,
+                              "completion_tokens_details": {"reasoning_tokens": 90}}}
+        return {"choices": [{"message": {"content": '{"findings": []}',
+                                         "reasoning_content": None},
+                             "finish_reason": "stop"}],
+                "usage": {"completion_tokens": 10,
+                          "completion_tokens_details": {"reasoning_tokens": 0}}}
+
+    client = DeepSeekClient(api_key="sk-test")
+    client._post = flaky_post
+    parsed = client.chat_json([{"role": "user", "content": "hi"}], max_tokens=100)
+    check("a truncated reply is recovered by the retry", parsed == {"findings": []}, parsed)
+    check("exactly one retry", len(attempts) == 2, len(attempts))
+    check("the first attempt thinks", attempts[0].get("thinking") == {"type": "enabled"})
+    check("the retry disables thinking",
+          attempts[1].get("thinking") == {"type": "disabled"}, attempts[1].get("thinking"))
+    check("the retry drops reasoning_effort", "reasoning_effort" not in attempts[1], attempts[1])
+    check("the retry gives the budget to the answer", attempts[1].get("temperature") == 0.2)
+    check("both attempts' thinking is kept for the saved transcript",
+          client.last_result.reasoning == "Deep thought.", client.last_result.reasoning)
+
+    # A run already without thinking must not be retried with thinking off again.
+    calls = []
+
+    def always_truncated(payload):
+        calls.append(payload)
+        return {"choices": [{"message": {"content": '{"a": 1', "reasoning_content": None},
+                             "finish_reason": "length"}],
+                "usage": {"completion_tokens": 5}}
+
+    off = DeepSeekClient(api_key="sk-test", thinking="disabled")
+    off._post = always_truncated
+    try:
+        off.chat_json([{"role": "user", "content": "hi"}], max_tokens=5)
+        check("a truncation with thinking off still raises", False)
+    except DeepSeekTruncation as exc:
+        check("a truncation with thinking off still raises", True)
+        check("no retry when thinking is already off", len(calls) == 1, len(calls))
+        check("the advice does not offer the switch already taken",
+              "deepseek-thinking disabled" not in str(exc), str(exc))
+
+    # Thinking on, but the retry truncates too: the advice must not send a
+    # low-effort run chasing --deepseek-reasoning-effort.
+    capped = DeepSeekClient(api_key="sk-test")
+    capped._post = always_truncated
+    try:
+        capped.chat_json([{"role": "user", "content": "hi"}], max_tokens=50)
+        check("a doubly-truncated reply raises", False)
+    except DeepSeekTruncation as exc:
+        message = str(exc)
+        check("a doubly-truncated reply raises", True)
+        check("the advice points at the budget", "--deepseek-max-tokens" in message, message)
+        check("the advice notes thinking was already disabled",
+              "thinking disabled" in message, message)
+        check("the advice no longer tells a low-effort run to lower effort",
+              "--deepseek-reasoning-effort" not in message, message)
+
+
+def test_analysis_truncation_reporting():
+    print("analysis: truncation is recorded apart from a connectivity failure")
+    evidence = Evidence(account=TARGET, profile="test", region="ap-southeast-1")
+    evidence.csv_data["org"] = [{"Account": TARGET, "Name": "This account",
+                                 "ID": TARGET, "isManagementAccount?": "false"}]
+    scope = make_scope()
+
+    class TruncatingClient:
+        def __init__(self):
+            self.last_result = None
+
+        def chat_json(self, messages, **kwargs):
+            raise DeepSeekTruncation("DeepSeek reply was cut off at max_tokens=100 "
+                                     "(finish_reason=length), so the JSON is incomplete.")
+
+    analysis = analyze(TruncatingClient(), evidence, scope)
+    check("both truncated stages are recorded",
+          len(analysis.truncated_stages) == 2, analysis.truncated_stages)
+    check("truncation is not counted as AI success", analysis.used_ai is False)
+    check("warnings say truncated, not failed",
+          all("truncated" in w for w in analysis.warnings), analysis.warnings)
+    check("the summary names the budget, not the network",
+          "token budget" in analysis.summary and "API key" not in analysis.summary,
+          analysis.summary)
+    check("the summary no longer claims only raw evidence is present",
+          "raw CloudFox evidence only" not in analysis.summary, analysis.summary)
+    check("the summary still claims the deterministic findings",
+          "SimulatePrincipalPolicy" in analysis.summary, analysis.summary)
+
+    class MixedClient:
+        """Stage 1 is cut off; stage 2 cannot reach the API at all."""
+
+        def __init__(self):
+            self.calls = 0
+            self.last_result = None
+
+        def chat_json(self, messages, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise DeepSeekTruncation("cut off at the token budget")
+            raise DeepSeekError("connection reset")
+
+    mixed = analyze(MixedClient(), evidence, scope)
+    check("only the truncated stage is recorded",
+          len(mixed.truncated_stages) == 1, mixed.truncated_stages)
+    check("a budget-caused failure is not blamed on the network",
+          "token budget" in mixed.summary, mixed.summary)
+
+    outage = analyze(BrokenClient(), evidence, scope)
+    check("an outage leaves truncated_stages empty", outage.truncated_stages == [])
+    check("an outage summary does not mention the token budget",
+          "token budget" not in outage.summary, outage.summary)
+
+
+def test_priority_ordering():
+    print("priority model: the deterministic worst-first table")
+    check("the table is the operator's fifteen, in order", len(priority.RULES) == 15,
+          len(priority.RULES))
+    check("worst first: the wildcard trust leads", priority.RULES[0].key == "wildcard-trust")
+    check("last: the cross-account bucket", priority.RULES[-1].key == "cross-account-bucket")
+    check("every rule states a condition",
+          all(r.category or r.actions or r.edge_shapes or r.patterns for r in priority.RULES))
+    check("the rendered table names each rule",
+          len(priority.PRIORITY_TABLE.splitlines()) == len(priority.RULES))
+
+    def finding(ident, **kwargs):
+        base = {"id": ident, "title": "", "severity": "Medium"}
+        base.update(kwargs)
+        return base
+
+    wildcard = finding("wildcard", category="Trust", severity="High",
+                       evidence='Trust policy: {"Principal": "*", "Action": "sts:AssumeRole"}')
+    passrole_ec2 = finding("passrole-ec2", category="Privilege Escalation", severity="High",
+                           primitives=["iam:PassRole"],
+                           edge={"shape": "EC2", "service": "ec2",
+                                 "target_role": f"arn:aws:iam::{TARGET}:role/admin"})
+    ssm = finding("ssm", category="Data Access", severity="High",
+                  primitives=["ssm:GetParameter"])
+    public_alb = finding("public-alb", category="Network", severity="High",
+                         evidence="Load balancer fsed-uat-alb has a public listener")
+    wide_ports = finding("wide-ports", category="Network", severity="High",
+                         evidence="Security group allows 0.0.0.0/0 on ports 1024-65535")
+    update_policy = finding("update-policy", category="Privilege Escalation", severity="High",
+                            primitives=["iam:UpdateAssumeRolePolicy"])
+    create_key = finding("create-key", category="Privilege Escalation", severity="High",
+                         primitives=["iam:CreateAccessKey"])
+    public_bucket = finding("public-bucket", category="Data Access", severity="High",
+                            evidence="S3 bucket mfa-eregister allows public read")
+    tail = finding("tail", category="Privilege Escalation", severity="Critical",
+                   primitives=["lambda:InvokeFunction"])
+
+    shuffled = [tail, public_bucket, ssm, create_key, update_policy, wide_ports,
+                public_alb, passrole_ec2, wildcard]
+    ordered = priority.sort_findings(shuffled)
+    expect = [wildcard, passrole_ec2, ssm, public_alb, wide_ports, update_policy,
+              create_key, public_bucket, tail]
+    check("findings sort into the table's order",
+          [f["id"] for f in ordered] == [f["id"] for f in expect],
+          [f["id"] for f in ordered])
+
+    # The rule the operator cares about: a named class beats an unnamed one,
+    # whatever grade the unnamed one carries.
+    known_low = finding("known-low", category="Trust", severity="Low",
+                        evidence=f"role trusts arn:aws:iam::999988887777:root (external account)")
+    unknown_critical = finding("unknown-critical", category="Privilege Escalation",
+                               severity="Critical", primitives=["lambda:InvokeFunction"])
+    ranked = priority.sort_findings([unknown_critical, known_low])
+    check("table rank dominates severity", ranked[0]["id"] == "known-low",
+          [f["id"] for f in ranked])
+
+    # Inside a rank and a severity, the incoming order survives — the model's own
+    # worst-first judgement is still signal.
+    first = finding("first", category="Privilege Escalation", severity="High",
+                    primitives=["lambda:InvokeFunction"])
+    second = finding("second", category="Privilege Escalation", severity="High",
+                     primitives=["lambda:InvokeFunction"])
+    check("ties keep their incoming order",
+          [f["id"] for f in priority.sort_findings([first, second])] == ["first", "second"])
+
+    check("an empty list sorts to empty", priority.sort_findings([]) == [])
+
+    # The report orders by the same table.
+    from cloudscan.report import _sort_findings
+    check("the report uses the priority table",
+          _sort_findings([unknown_critical, known_low])[0]["id"] == "known-low")
+
+    # The stage cap keeps the table's head, not the alphabet's.
+    util.configure_logging(quiet=True)
+    try:
+        capped = prompts._worst_first([tail, wildcard, ssm], 2)
+    finally:
+        util.configure_logging()
+    check("the stage cap keeps the highest-priority items",
+          [f["id"] for f in capped] == ["wildcard", "ssm"], [f["id"] for f in capped])
 
 
 # ---------------------------------------------------------------------------
@@ -1432,6 +1670,9 @@ def main():
     test_thinking_display()
     test_analysis_pipeline()
     test_report_render()
+    test_deepseek_budget_recovery()
+    test_analysis_truncation_reporting()
+    test_priority_ordering()
     test_verify_candidates()
     test_verify_grouping()
     test_verify_verdicts()

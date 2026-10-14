@@ -136,6 +136,28 @@ reviewable after the fact — the live stream scrolls away, the file does not. `
 the stream as well. Thinking itself is on by default; set `--deepseek-thinking disabled`
 to stop it at the source.
 
+### Token budget and cut-off replies
+
+Thinking and the answer share a single completion allowance, so a stage whose chain of
+thought runs long can be cut off before it has written its JSON. awscloudscan now sizes
+each stage for both: **32,000** tokens for the escalation-path stage and **48,000** for
+the findings stage. If a reply is nevertheless cut off, the stage is retried **once with
+thinking disabled**, which hands the whole budget to the answer; only if that also fails
+does the stage give up. Either way the run reports it as a budget problem, not as a bad
+API key or a network fault.
+
+If a stage is still reported as cut off — which now means it did not fit even without
+thinking — raise the ceiling:
+
+```bash
+awscloudscan -p prof -r region --deepseek-max-tokens 96000
+export AWSSCLOUDSCAN_DEEPSEEK_MAX_TOKENS=96000   # the same, from the environment
+```
+
+`--deepseek-max-tokens` sets both stages at once. The stages that were cut off are named
+in `analysis.json` (`truncated_stages`), so a later reader can tell a budget problem from
+an outage without reading the log.
+
 ## Usage
 
 ```
@@ -169,6 +191,7 @@ awscloudscan -p PROFILE -r REGION [options]
 | `--deepseek-reasoning-effort` | Thinking effort: `low`, `high`, `max` (default `low`) |
 | `--deepseek-thinking` | Thinking mode: `enabled` or `disabled` (default `enabled`) |
 | `--show-thinking` / `--no-show-thinking` | Stream the model's reasoning to stdout as it is generated (**on by default**); the saved copy is written either way |
+| `--deepseek-max-tokens` | Completion budget for each DeepSeek stage (defaults: 32000 for escalation paths, 48000 for findings). Thinking draws from this same budget |
 | `--digest-budget` | Max characters of evidence sent to DeepSeek (default 600000) |
 | `--exclude-account` | Extra account id to treat as out of scope (repeatable) |
 | `--include-out-of-scope` | Also render excluded items inline |
@@ -265,6 +288,15 @@ of false alarms:
 Reading one object is not privilege escalation, and it does not belong in the same
 severity band as the ability to grant yourself admin. Only the unscoped forms are ranked
 as a serious exposure.
+
+Findings then rank **worst first by a built-in priority table, not by the model**. The
+classes that matter in this environment come first in a declared order — a trust of
+`Principal: "*"`, `iam:PassRole` into EC2, a public API Gateway, readable SSM secrets,
+root trusts without an `sts:ExternalId`, and so on — and everything the table does not
+name follows by severity. Rank beats severity, so a known class is never buried under an
+unnamed one, and because the ordering is a pure function of the findings it is identical
+whether or not the DeepSeek review ran. The same order is used in the report and in
+`analysis.json`.
 
 Finally, **two classes of principal never originate a finding**, because their privilege is
 the account's intended design rather than a weakness:

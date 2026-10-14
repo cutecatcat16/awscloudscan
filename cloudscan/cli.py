@@ -168,6 +168,11 @@ def build_parser() -> argparse.ArgumentParser:
     ai.add_argument("--show-thinking", action=argparse.BooleanOptionalAction, default=True,
                     help="stream the model's reasoning to stdout as it is generated "
                          "(default: on; --no-show-thinking to quiet it — a copy is saved either way)")
+    ai.add_argument("--deepseek-max-tokens", type=int, default=None,
+                    help="completion budget, in tokens, for each DeepSeek stage "
+                         f"(defaults: {config.DEEPSEEK_STAGE1_MAX_TOKENS} for escalation paths, "
+                         f"{config.DEEPSEEK_STAGE2_MAX_TOKENS} for findings). Thinking draws from "
+                         "this same budget, so raise it if a stage is cut off")
     ai.add_argument("--digest-budget", type=int, default=None,
                     help=f"max characters of evidence sent to DeepSeek (default: {config.MAX_EVIDENCE_CHARS})")
 
@@ -441,13 +446,28 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 step("running DeepSeek review")
                 analysis = analyze(client, evidence, scope, digest_budget=args.digest_budget,
-                                   stream_reasoning=args.show_thinking)
+                                   stream_reasoning=args.show_thinking,
+                                   max_tokens=args.deepseek_max_tokens)
                 if analysis.used_ai:
                     ok("DeepSeek review complete")
+                    if analysis.truncated_stages:
+                        warn("DeepSeek output was truncated for "
+                             + ", ".join(analysis.truncated_stages)
+                             + " — that stage's output is incomplete (retry with a higher "
+                               "--deepseek-max-tokens)")
                 else:
                     ai_failed = True
-                    error("every DeepSeek request failed — no AI analysis was produced.")
-                    error("Check the API key and network access to " + config.DEEPSEEK_DEFAULT_BASE_URL)
+                    if analysis.truncated_stages:
+                        # The API answered; the reply was too big for the budget. Saying
+                        # "check the API key and network" here would send the operator
+                        # after a problem that does not exist.
+                        error("no AI analysis was produced — the reply was cut off at its "
+                              "token budget for: " + ", ".join(analysis.truncated_stages))
+                        error("Raise --deepseek-max-tokens, or run with --deepseek-thinking "
+                              "disabled so the whole completion budget belongs to the answer.")
+                    else:
+                        error("every DeepSeek request failed — no AI analysis was produced.")
+                        error("Check the API key and network access to " + config.DEEPSEEK_DEFAULT_BASE_URL)
         except DeepSeekError as exc:
             warn(f"DeepSeek review failed: {exc}")
             ai_failed = True
@@ -518,6 +538,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             "in_scope_findings": in_scope,
             "out_of_scope_findings": out_of_scope,
             "warnings": analysis.warnings,
+            # Stages whose reply was cut off at its token budget. Kept apart from
+            # the warnings so a later reader can tell a budget problem from an
+            # outage without parsing message text.
+            "truncated_stages": list(getattr(analysis, "truncated_stages", []) or []),
             # Recorded so the artifact says for itself whether the review stage
             # ran, rather than leaving it to be inferred from the report header.
             "used_ai": bool(analysis.used_ai),

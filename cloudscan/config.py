@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 APP_NAME = "awscloudscan"
 
@@ -130,6 +130,47 @@ DEEPSEEK_KEY_ENV_VARS = (
 )
 DEEPSEEK_TIMEOUT = int(os.getenv("AWSSCLOUDSCAN_DEEPSEEK_TIMEOUT", "300"))
 DEEPSEEK_MAX_RETRIES = 3
+
+# Per-stage completion budgets. In thinking mode the chain of thought is drawn
+# from *this same* allowance, so a budget sized for the JSON alone leaves the
+# answer to be cut off mid-object whenever the model thinks at length — which it
+# does: a real run spent 5,117 of an 8,000-token stage-1 budget thinking, and
+# 6,265 of 12,000 on stage 2, truncating both. These defaults are roughly 4x the
+# old values, enough for a long chain of thought *and* the answer it produces.
+# ``--deepseek-max-tokens`` overrides both at once; AWSSCLOUDSCAN_DEEPSEEK_MAX_TOKENS
+# does the same from the environment.
+DEEPSEEK_STAGE1_MAX_TOKENS = 32000
+DEEPSEEK_STAGE2_MAX_TOKENS = 48000
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read a positive integer from the environment, ignoring empty/garbage input."""
+    raw = os.getenv(name)
+    if not raw or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+DEEPSEEK_STAGE1_MAX_TOKENS = _env_int("AWSSCLOUDSCAN_DEEPSEEK_MAX_TOKENS",
+                                      DEEPSEEK_STAGE1_MAX_TOKENS)
+DEEPSEEK_STAGE2_MAX_TOKENS = _env_int("AWSSCLOUDSCAN_DEEPSEEK_MAX_TOKENS",
+                                      DEEPSEEK_STAGE2_MAX_TOKENS)
+
+
+def deepseek_stage_budgets(override: Optional[int] = None) -> Tuple[int, int]:
+    """The ``(stage1, stage2)`` completion budgets, honouring an explicit override.
+
+    ``--deepseek-max-tokens N`` sets both stages to N. Without it each stage keeps
+    its own default — the findings stage is the larger of the two because it
+    returns the bigger JSON object.
+    """
+    if override and override > 0:
+        return (override, override)
+    return (DEEPSEEK_STAGE1_MAX_TOKENS, DEEPSEEK_STAGE2_MAX_TOKENS)
 
 # ---------------------------------------------------------------------------
 # Evidence budgets (keep LLM requests inside the context window)
