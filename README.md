@@ -15,9 +15,10 @@ awscloudscan -p <profile-name> -r <region>
    AWS CLI, the `requests` library), so it works on a fresh machine.
 2. **Resolves the identity** behind `-p <profile>` (`sts:GetCallerIdentity`) to learn the
    account id and caller ARN.
-3. **Runs CloudFox** — a curated set of modules (inventory, principals, permissions,
-   iam-simulator, role-trusts, resource-trusts, workloads, secrets, buckets, databases,
-   endpoints, env-vars, ECS/Lambda/EC2, network-ports, RAM, CloudFormation, …). Output
+3. **Runs CloudFox** — a curated set of modules by default (inventory, principals,
+   permissions, iam-simulator, role-trusts, resource-trusts, workloads, secrets, buckets,
+   databases, endpoints, env-vars, ECS/Lambda/EC2, network-ports, RAM, CloudFormation, …),
+   or CloudFox's complete set with `--all-modules` (see [Full run](#full-run)). Output
    lands in `awscloudscan-output/cloudfox/aws/<profile>-<account>/`.
 4. **Runs PMapper** — `graph create` (with `--ignore-orgs` by default, so SCP/org data is
    not mixed in) followed by `analysis`, plus CloudFox's own `pmapper` module to turn the
@@ -148,7 +149,7 @@ awscloudscan -p PROFILE -r REGION [options]
 | `-o, --output-dir` | Working directory (default `./awscloudscan-output`); passed to CloudFox as `--outdir` |
 | `--report-path` | Explicit path for the Markdown report |
 | `--modules` | Comma-separated CloudFox modules (default: curated set) |
-| `--all-modules` | Run CloudFox's full `all-checks` set |
+| `--all-modules` | **Full run.** Run CloudFox's complete `all-checks` set instead of the curated default. Provides `permissions`, so `iam:SimulatePrincipalPolicy` verification has candidates to check |
 | `--skip-cloudfox` / `--skip-pmapper` | Skip one of the tools |
 | `--skip-pmapper-create` | Reuse an existing PMapper graph |
 | `--pmapper-all-regions` | Let PMapper sweep every region (default: only the `-r` region) |
@@ -181,6 +182,9 @@ awscloudscan -p PROFILE -r REGION [options]
 # Standard run
 awscloudscan -p mfa-cloud-uat-auditor-user -r ap-southeast-1
 
+# Full run — every module CloudFox's all-checks covers
+awscloudscan -p prod-admin -r us-east-1 --all-modules
+
 # Quick, IAM-focused run
 awscloudscan -p prod-admin -r us-east-1 --modules inventory,principals,permissions,iam-simulator,role-trusts,workloads
 
@@ -190,6 +194,24 @@ awscloudscan -p prod-admin -r us-east-1 --offline --cloudfox-output-dir ./cloudf
 # No AI, deterministic report only
 awscloudscan -p prod-admin -r us-east-1 --no-ai
 ```
+
+### Full run
+
+The default module set is a curated list, not everything CloudFox can do. For a full scan
+of the account, pass `--all-modules`, which hands CloudFox its own `all-checks` set:
+
+```bash
+awscloudscan -p PROFILE -r REGION --all-modules
+```
+
+This is the run to use when you want the whole picture rather than a targeted pass.
+`all-checks` includes `permissions`, the `permissions.csv` table that feeds the
+`iam:SimulatePrincipalPolicy` verification step — without it every candidate grant stays
+unverified. It also adds `tags` and `route53` on top of the curated default.
+
+Two modules are **not** part of `all-checks`: `sns` and `resource-trusts`, and CloudFox
+skips `outbound-assumed-roles` inside it. A full run therefore does not cover
+cross-account SNS or resource-policy trust edges.
 
 ## Account scope: what is included and what is not
 
